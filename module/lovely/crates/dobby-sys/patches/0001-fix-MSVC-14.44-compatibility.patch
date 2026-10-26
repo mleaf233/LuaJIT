@@ -1,0 +1,168 @@
+From 538b36fb0e6a5b1e70b87f141ed255386cf1d3b8 Mon Sep 17 00:00:00 2001
+From: mleaf233 <magicleaf06151@gmail.com>
+Date: Wed, 2 Sep 2026 13:58:12 +0800
+Subject: [PATCH 1/2] fix: MSVC 14.44 compatibility
+
+- dobby.h: use comma-before-... in variadic macro and __VA_ARGS__ with ## to
+  accept zero-argument calls (matches MSVC variadic macro rules).
+- platform.h: add AllocPageSize, align OSMemory signatures with the Windows
+  implementation (size_t for size args).
+- platform-windows.cc: implement Allocate(size_t, MemoryPermission, void*)
+  with nullptr default, matching the posix version's calling convention.
+- ProcessRuntimeUtility.cc: MemRange has start/end/size, not .address; use
+  MemRegion (subclass with permission) for vector elements matching the
+  header's declaration.
+- code-patch-tool-windows.cc: define kMemoryOperationError locally (it is
+  referenced but never defined in upstream).
+---
+ include/dobby.h                               | 16 +++++++-------
+ .../ExecMemory/code-patch-tool-windows.cc     |  2 ++
+ .../Windows/ProcessRuntimeUtility.cc          | 10 ++++-----
+ .../UnifiedInterface/platform-windows.cc      | 22 +++++++++++++------
+ source/PlatformUnifiedInterface/platform.h    |  2 ++
+ 5 files changed, 32 insertions(+), 20 deletions(-)
+
+diff --git a/include/dobby.h b/include/dobby.h
+index 745b798..1511f92 100644
+--- a/include/dobby.h
++++ b/include/dobby.h
+@@ -108,14 +108,14 @@ typedef struct {
+ } DobbyRegisterContext;
+ #endif
+ 
+-#define install_hook_name(name, fn_ret_t, fn_args_t...)                                                                \
+-  static fn_ret_t fake_##name(fn_args_t);                                                                              \
+-  static fn_ret_t (*orig_##name)(fn_args_t);                                                                           \
+-  /* __attribute__((constructor)) */ static void install_hook_##name(void *sym_addr) {                                 \
+-    DobbyHook(sym_addr, (dobby_dummy_func_t)fake_##name, (dobby_dummy_func_t *)&orig_##name);                          \
+-    return;                                                                                                            \
+-  }                                                                                                                    \
+-  fn_ret_t fake_##name(fn_args_t)
++#define install_hook_name(name, fn_ret_t, fn_args_t, ...)                                                              \
++  static fn_ret_t fake_##name(fn_args_t, ##__VA_ARGS__);                                                                \
++  static fn_ret_t (*orig_##name)(fn_args_t, ##__VA_ARGS__);                                                             \
++  /* __attribute__((constructor)) */ static void install_hook_##name(void *sym_addr) {                                   \
++    DobbyHook(sym_addr, (dobby_dummy_func_t)fake_##name, (dobby_dummy_func_t *)&orig_##name);                            \
++    return;                                                                                                              \
++  }                                                                                                                      \
++  fn_ret_t fake_##name(fn_args_t, ##__VA_ARGS__)
+ 
+ // memory code patch
+ int DobbyCodePatch(void *address, uint8_t *buffer, uint32_t buffer_size);
+diff --git a/source/Backend/UserMode/ExecMemory/code-patch-tool-windows.cc b/source/Backend/UserMode/ExecMemory/code-patch-tool-windows.cc
+index 471a467..239a444 100644
+--- a/source/Backend/UserMode/ExecMemory/code-patch-tool-windows.cc
++++ b/source/Backend/UserMode/ExecMemory/code-patch-tool-windows.cc
+@@ -4,6 +4,8 @@
+ 
+ using namespace zz;
+ 
++enum { kMemoryOperationError = -1 };
++
+ PUBLIC int DobbyCodePatch(void *address, uint8_t *buffer, uint32_t buffer_size) {
+   DWORD oldProtect;
+   int page_size;
+diff --git a/source/Backend/UserMode/PlatformUtil/Windows/ProcessRuntimeUtility.cc b/source/Backend/UserMode/PlatformUtil/Windows/ProcessRuntimeUtility.cc
+index 632bfc5..94a00e9 100755
+--- a/source/Backend/UserMode/PlatformUtil/Windows/ProcessRuntimeUtility.cc
++++ b/source/Backend/UserMode/PlatformUtil/Windows/ProcessRuntimeUtility.cc
+@@ -9,14 +9,14 @@
+ // ================================================================
+ // GetProcessMemoryLayout
+ 
+-static bool memory_region_comparator(MemRange a, MemRange b) {
+-  return (a.address > b.address);
++static bool memory_region_comparator(MemRegion a, MemRegion b) {
++  return (a.start > b.start);
+ }
+ 
+ // https://gist.github.com/jedwardsol/9d4fe1fd806043a5767affbd200088ca
+ 
+-tinystl::vector<MemRange> ProcessMemoryLayout;
+-tinystl::vector<MemRange> ProcessRuntimeUtility::GetProcessMemoryLayout() {
++tinystl::vector<MemRegion> ProcessMemoryLayout;
++tinystl::vector<MemRegion> ProcessRuntimeUtility::GetProcessMemoryLayout() {
+   if (!ProcessMemoryLayout.empty()) {
+     ProcessMemoryLayout.clear();
+   }
+@@ -53,7 +53,7 @@ tinystl::vector<MemRange> ProcessRuntimeUtility::GetProcessMemoryLayout() {
+       break;
+     }
+ 
+-    ProcessMemoryLayout.push_back(MemRange{(void *)region.BaseAddress, region.RegionSize, permission});
++    ProcessMemoryLayout.push_back(MemRegion{(addr_t)region.BaseAddress, region.RegionSize, permission});
+   }
+   return ProcessMemoryLayout;
+ }
+diff --git a/source/Backend/UserMode/UnifiedInterface/platform-windows.cc b/source/Backend/UserMode/UnifiedInterface/platform-windows.cc
+index 30af5b8..19b0acf 100644
+--- a/source/Backend/UserMode/UnifiedInterface/platform-windows.cc
++++ b/source/Backend/UserMode/UnifiedInterface/platform-windows.cc
+@@ -33,36 +33,44 @@ int OSMemory::PageSize() {
+   return lastRet;
+ }
+ 
+-void *OSMemory::Allocate(void *address, int size, MemoryPermission access) {
+-  DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % AllocPageSize());
++void *OSMemory::Allocate(size_t size, MemoryPermission access) {
++  return OSMemory::Allocate(size, access, nullptr);
++}
++
++void *OSMemory::Allocate(size_t size, MemoryPermission access, void *fixed_address) {
++  if (fixed_address != nullptr) {
++    DCHECK_EQ(0, reinterpret_cast<uintptr_t>(fixed_address) % AllocPageSize());
++  }
+   DCHECK_EQ(0, size % PageSize());
+ 
+-  void *result = VirtualAlloc(address, size, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS);
+-  OSMemory::SetPermission(result, size, kReadWriteExecute);
++  void *result = VirtualAlloc(fixed_address, size, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS);
+   if (result == nullptr)
+     return nullptr;
+ 
++  // Apply requested access permissions.
++  OSMemory::SetPermission(result, size, access);
++
+   // TODO: if need align
+   void *aligned_base = result;
+   return static_cast<void *>(aligned_base);
+ }
+ 
+ // static
+-bool OSMemory::Free(void *address, const int size) {
++bool OSMemory::Free(void *address, size_t size) {
+   DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % PageSize());
+   DCHECK_EQ(0, size % PageSize());
+ 
+   return VirtualFree(address, size, MEM_RELEASE);
+ }
+ 
+-bool OSMemory::Release(void *address, int size) {
++bool OSMemory::Release(void *address, size_t size) {
+   DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % PageSize());
+   DCHECK_EQ(0, size % PageSize());
+ 
+   return OSMemory::Free(address, size);
+ }
+ 
+-bool OSMemory::SetPermission(void *address, int size, MemoryPermission access) {
++bool OSMemory::SetPermission(void *address, size_t size, MemoryPermission access) {
+   DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % PageSize());
+   DCHECK_EQ(0, size % PageSize());
+ 
+diff --git a/source/PlatformUnifiedInterface/platform.h b/source/PlatformUnifiedInterface/platform.h
+index 77a05ff..09afe4f 100644
+--- a/source/PlatformUnifiedInterface/platform.h
++++ b/source/PlatformUnifiedInterface/platform.h
+@@ -63,6 +63,8 @@ class OSMemory {
+ public:
+   static int PageSize();
+ 
++  static int AllocPageSize();
++
+   static void *Allocate(size_t size, MemoryPermission access);
+ 
+   static void *Allocate(size_t size, MemoryPermission access, void *fixed_address);
+-- 
+2.32.0.windows.2
+

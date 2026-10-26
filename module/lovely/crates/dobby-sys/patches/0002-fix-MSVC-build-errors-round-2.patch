@@ -1,0 +1,83 @@
+From db7523633852f25e6ef554dc0221d60d3342cde4 Mon Sep 17 00:00:00 2001
+From: mleaf233 <magicleaf06151@gmail.com>
+Date: Wed, 2 Sep 2026 14:00:29 +0800
+Subject: [PATCH 2/2] fix: MSVC build errors round 2
+
+- dobby.cpp: gate __attribute__((constructor)) with #ifndef _MSC_VER; MSVC
+  lacks the extension but the function is a debug log on load.
+- ProcessRuntimeUtility.cc (Windows): match the const vector<T>& return
+  type declared in the header instead of returning by value, and remove
+  the previous bug where GetProcessModuleMap cleared ProcessMemoryLayout
+  instead of returning ProcessModuleMap.
+---
+ .../PlatformUtil/Windows/ProcessRuntimeUtility.cc    | 12 ++++++------
+ source/dobby.cpp                                     | 12 ++++++++++++
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/source/Backend/UserMode/PlatformUtil/Windows/ProcessRuntimeUtility.cc b/source/Backend/UserMode/PlatformUtil/Windows/ProcessRuntimeUtility.cc
+index 94a00e9..7097e77 100755
+--- a/source/Backend/UserMode/PlatformUtil/Windows/ProcessRuntimeUtility.cc
++++ b/source/Backend/UserMode/PlatformUtil/Windows/ProcessRuntimeUtility.cc
+@@ -16,7 +16,7 @@ static bool memory_region_comparator(MemRegion a, MemRegion b) {
+ // https://gist.github.com/jedwardsol/9d4fe1fd806043a5767affbd200088ca
+ 
+ tinystl::vector<MemRegion> ProcessMemoryLayout;
+-tinystl::vector<MemRegion> ProcessRuntimeUtility::GetProcessMemoryLayout() {
++const tinystl::vector<MemRegion> &ProcessRuntimeUtility::GetProcessMemoryLayout() {
+   if (!ProcessMemoryLayout.empty()) {
+     ProcessMemoryLayout.clear();
+   }
+@@ -63,16 +63,16 @@ tinystl::vector<MemRegion> ProcessRuntimeUtility::GetProcessMemoryLayout() {
+ 
+ tinystl::vector<RuntimeModule> ProcessModuleMap;
+ 
+-tinystl::vector<RuntimeModule> ProcessRuntimeUtility::GetProcessModuleMap() {
+-  if (!ProcessMemoryLayout.empty()) {
+-    ProcessMemoryLayout.clear();
++const tinystl::vector<RuntimeModule> &ProcessRuntimeUtility::GetProcessModuleMap() {
++  if (!ProcessModuleMap.empty()) {
++    return ProcessModuleMap;
+   }
+   return ProcessModuleMap;
+ }
+ 
+ RuntimeModule ProcessRuntimeUtility::GetProcessModule(const char *name) {
+-  tinystl::vector<RuntimeModule> ProcessModuleMap = GetProcessModuleMap();
+-  for (auto module : ProcessModuleMap) {
++  const tinystl::vector<RuntimeModule> &modules = GetProcessModuleMap();
++  for (auto &module : modules) {
+     if (strstr(module.path, name) != 0) {
+       return module;
+     }
+diff --git a/source/dobby.cpp b/source/dobby.cpp
+index 18b847b..207f30c 100644
+--- a/source/dobby.cpp
++++ b/source/dobby.cpp
+@@ -1,12 +1,24 @@
+ #include "dobby/dobby_internal.h"
+ #include "Interceptor.h"
+ 
++#ifndef _MSC_VER
+ __attribute__((constructor)) static void ctor() {
+   DEBUG_LOG("================================");
+   DEBUG_LOG("Dobby");
+   DEBUG_LOG("dobby in debug log mode, disable with cmake flag \"-DDOBBY_DEBUG=OFF\"");
+   DEBUG_LOG("================================");
+ }
++#else
++// MSVC does not support __attribute__((constructor)). The ctor is purely a
++// debug log on library load; on Windows the loader still maps the static
++// library, so omitting the constructor has no functional impact.
++static void ctor() {
++  DEBUG_LOG("================================");
++  DEBUG_LOG("Dobby");
++  DEBUG_LOG("dobby in debug log mode, disable with cmake flag \"-DDOBBY_DEBUG=OFF\"");
++  DEBUG_LOG("================================");
++}
++#endif
+ 
+ PUBLIC const char *DobbyGetVersion() {
+   return "";
+-- 
+2.32.0.windows.2
+
