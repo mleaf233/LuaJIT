@@ -10,3 +10,6 @@
 *.dmp
 *.swp
 .tags
+
+# build_android.ps1 的输出目录
+/android/

@@ -93,18 +93,38 @@ if ($Clean) {
     Remove-Item (Join-Path $SrcDir "host\minilua.exe"),(Join-Path $SrcDir "host\buildvm.exe") -Force -ErrorAction SilentlyContinue
 }
 
-# ---------------------------------------------------------------- host 工具
+# ---------------------------------------------------------------- host 工具（第一步：minilua）
 if (-not $SkipHostTools) {
-    Step "编译 host 工具（MSVC）"
+    Step "编译 host 工具 minilua（MSVC）"
     Push-Location $SrcDir
     try {
         New-Item -ItemType Directory -Force -Path "host" | Out-Null
-
-        # minilua：单文件，纯 C
         & $Cl /nologo /O2 /MD /D_CRT_SECURE_NO_WARNINGS /I. /Fe:host/minilua.exe /Fo:host/minilua.o host/minilua.c
         if ($LASTEXITCODE -ne 0) { Fail "minilua 编译失败" }
+    } finally { Pop-Location }
+}
 
-        # buildvm：必须带目标架构宏，否则 vm_<arch>.dasc 里的 #error 会触发
+# ---------------------------------------------------------------- 生成头文件
+# 注意顺序：buildvm.c 会 #include "luajit.h"，而 luajit.h 要用 minilua 生成，
+# 所以必须先跑这一步，再编 buildvm。
+Step "生成 luajit.h / buildvm_arch.h"
+Push-Location $SrcDir
+try {
+    & git show -s --format=%ct | Out-File -Encoding ascii -NoNewline luajit_relver.txt
+    & ".\host\minilua.exe" "host\genversion.lua"
+    if ($LASTEXITCODE -ne 0) { Fail "生成 luajit.h 失败" }
+
+    $dasmFlags = @("-D","ENDIAN_LE","-D","P64","-D","JIT","-D","FFI","-D","DUALNUM","-D","FPU","-D","HFABI")
+    & ".\host\minilua.exe" "..\dynasm\dynasm.lua" @dasmFlags -o "host\buildvm_arch.h" "vm_$DynArch.dasc"
+    if ($LASTEXITCODE -ne 0) { Fail "dynasm 生成 buildvm_arch.h 失败" }
+} finally { Pop-Location }
+
+# ---------------------------------------------------------------- host 工具（第二步：buildvm）
+if (-not $SkipHostTools) {
+    Step "编译 host 工具 buildvm（MSVC）"
+    Push-Location $SrcDir
+    try {
+        # 必须带目标架构宏，否则 vm_<arch>.dasc 里的 #error 会触发（host 是 x64，LJ_DUALNUM=0）
         & $Cl /nologo /O2 /MD /D_CRT_SECURE_NO_WARNINGS /I. /Ihost `
               /DLUAJIT_TARGET=LUAJIT_ARCH_$DynArch /DLJ_ARCH_HASFPU=1 /DLJ_ABI_SOFTFP=0 `
               /Fe:host/buildvm.exe /Fo:host/ `
@@ -119,19 +139,6 @@ if (-not $SkipHostTools) {
         (Get-Item "host\buildvm.exe").LastWriteTime = Get-Date
     } finally { Pop-Location }
 }
-
-# ---------------------------------------------------------------- 生成头文件
-Step "生成 buildvm_arch.h / luajit.h"
-Push-Location $SrcDir
-try {
-    $dasmFlags = @("-D","ENDIAN_LE","-D","P64","-D","JIT","-D","FFI","-D","DUALNUM","-D","FPU","-D","HFABI")
-    & ".\host\minilua.exe" "..\dynasm\dynasm.lua" @dasmFlags -o "host\buildvm_arch.h" "vm_$DynArch.dasc"
-    if ($LASTEXITCODE -ne 0) { Fail "dynasm 生成 buildvm_arch.h 失败" }
-
-    & git show -s --format=%ct | Out-File -Encoding ascii -NoNewline luajit_relver.txt
-    & ".\host\minilua.exe" "host\genversion.lua"
-    if ($LASTEXITCODE -ne 0) { Fail "生成 luajit.h 失败" }
-} finally { Pop-Location }
 
 # ---------------------------------------------------------------- LuaJIT
 Step "交叉编译 LuaJIT（amalg / static）"
@@ -167,17 +174,33 @@ if (-not (Test-Path $LovelyLib)) { Fail "找不到 liblovely.a: $LovelyLib" }
 Step "合并 liblovely 进 libluajit.a"
 Push-Location $SrcDir
 try {
-    $mri = @"
-create libluajit-merged.a
-addlib libluajit.a
-addlib $LovelyLib
-save
-end
-"@
-    $mriPath = Join-Path $env:TEMP "luajit_merge.mri"
-    Set-Content -Path $mriPath -Value $mri -Encoding ascii
-    & $Ar -M < $mriPath
-    if ($LASTEXITCODE -ne 0) { Fail "合并失败" }
+    # 不用 llvm-ar 的 MRI 脚本（PowerShell 往原生程序 stdin 送数据会带 BOM，
+    # llvm-ar 会把 BOM 当成命令的一部分报 "unknown command"）。
+    # 改成：把两个归档解包到临时目录，再一次性重打包。成员名已确认无冲突。
+    $tmp = Join-Path $env:TEMP "luajit_merge_tmp"
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+    Push-Location $tmp
+    try {
+        & $Ar x (Join-Path $SrcDir "libluajit.a")
+        if ($LASTEXITCODE -ne 0) { Fail "解包 libluajit.a 失败" }
+        & $Ar x $LovelyLib
+        if ($LASTEXITCODE -ne 0) { Fail "解包 liblovely.a 失败" }
+
+        $objs = Get-ChildItem -Path $tmp -Filter *.o | Select-Object -ExpandProperty Name
+        if ($objs.Count -lt 2) { Fail "解包后没有目标文件" }
+
+        $merged = Join-Path $SrcDir "libluajit-merged.a"
+        Remove-Item $merged -Force -ErrorAction SilentlyContinue
+        $chunk = 100
+        for ($i = 0; $i -lt $objs.Count; $i += $chunk) {
+            $end   = [Math]::Min($i + $chunk - 1, $objs.Count - 1)
+            $batch = $objs[$i..$end]
+            if ($i -eq 0) { & $Ar rcs $merged @batch } else { & $Ar rs $merged @batch }
+            if ($LASTEXITCODE -ne 0) { Fail "打包失败（第 $i 批）" }
+        }
+    } finally { Pop-Location }
 } finally { Pop-Location }
 
 # ---------------------------------------------------------------- 输出
