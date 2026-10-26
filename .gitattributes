@@ -1,1 +1,4 @@
 /.relver export-subst
+
+# shell 脚本必须保持 LF，否则 CI 上 bash 会报 $'': command not found
+*.sh text eol=lf
